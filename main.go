@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
 	"os"
+	"os/signal"
+	"syscall"
 
-	"main/internal/config"
+	"github.com/brody192/pg_backup/internal/config"
 
 	"github.com/brody192/logger"
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if !config.Backup.RunOnStart {
 		logger.Stdout.Warn("Skipping database backup, not configured to run on startup")
 		os.Exit(0)
@@ -16,7 +21,7 @@ func main() {
 
 	logger.Stdout.Info("Checking access to bucket...")
 
-	if err := CheckBucketAccess(); err != nil {
+	if err := CheckBucketAccess(ctx); err != nil {
 		logger.Stderr.Error("Error checking bucket access", logger.ErrAttr(err))
 		os.Exit(1)
 	}
@@ -25,7 +30,7 @@ func main() {
 
 	logger.Stdout.Info("Starting backup...")
 
-	if err := RunBackup(); err != nil {
+	if err := RunBackup(ctx); err != nil {
 		logger.Stderr.Error("Error while running backup.. Exiting..", logger.ErrAttr(err))
 		os.Exit(1)
 	}

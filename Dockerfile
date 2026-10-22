@@ -22,4 +22,4 @@ COPY --from=builder /app/main ./
 
 CMD pg_isready --dbname=$BACKUP_DATABASE_URL && \
     pg_dump --version && \
-    /app/main
+    exec /app/main

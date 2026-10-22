@@ -1,4 +1,4 @@
-module main
+module github.com/brody192/pg_backup
 
 go 1.22.0
 
