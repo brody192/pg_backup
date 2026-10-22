@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/brody192/pg_backup/internal/config"
@@ -15,24 +17,48 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-func NewS3Client() *s3.Client {
+func NewS3Client() (*s3.Client, error) {
+	endpoint, err := normalizeS3Endpoint(config.AWS.S3Endpoint)
+	if err != nil {
+		return nil, err
+	}
 	return s3.NewFromConfig(aws.Config{
-		Region: config.AWS.S3Region,
-		EndpointResolverWithOptions: aws.EndpointResolverWithOptionsFunc(func(_, _ string, _ ...any) (aws.Endpoint, error) {
-			endpoint := aws.Endpoint{SigningRegion: config.AWS.S3Region}
-
-			if config.AWS.S3Endpoint != "" {
-				endpoint.URL = config.AWS.S3Endpoint
-			}
-
-			return endpoint, nil
-		}),
+		Region:      config.AWS.S3Region,
 		Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(config.AWS.AccessKeyID, config.AWS.SecretAccessKey, "")),
-	})
+	}, func(options *s3.Options) {
+		// Leave endpoint resolution to the SDK when using standard AWS S3.
+		if endpoint != "" {
+			options.BaseEndpoint = aws.String(endpoint)
+		}
+	}), nil
+}
+
+func normalizeS3Endpoint(endpoint string) (string, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(endpoint, "//") {
+		endpoint = "https:" + endpoint
+	} else if !strings.Contains(endpoint, "://") {
+		endpoint = "https://" + endpoint
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Hostname() == "" || strings.HasSuffix(u.Host, ":") || (u.Scheme != "https" && u.Scheme != "http") {
+		return "", errors.New("AWS_S3_ENDPOINT must be an HTTP(S) URL or hostname, for example https://<account-id>.r2.cloudflarestorage.com")
+	}
+	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return "", errors.New("AWS_S3_ENDPOINT must not contain credentials, a query string, or a fragment")
+	}
+	return u.String(), nil
 }
 
 func CheckBucketAccess(ctx context.Context) error {
-	if _, err := NewS3Client().ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+	client, err := NewS3Client()
+	if err != nil {
+		return err
+	}
+	if _, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket:  &config.AWS.S3Bucket,
 		MaxKeys: aws.Int32(0),
 	}); err != nil {
@@ -47,7 +73,11 @@ type uploadInfo struct {
 }
 
 func UploadToS3(ctx context.Context, dumpFilename string, body io.ReadCloser) (*uploadInfo, error) {
-	return uploadToS3(ctx, NewS3Client(), dumpFilename, body)
+	client, err := NewS3Client()
+	if err != nil {
+		return nil, err
+	}
+	return uploadToS3(ctx, client, dumpFilename, body)
 }
 
 func uploadToS3(ctx context.Context, client manager.UploadAPIClient, dumpFilename string, body io.ReadCloser) (*uploadInfo, error) {

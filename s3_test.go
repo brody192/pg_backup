@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"math/rand"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,67 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
+
+type endpointTestHTTPClient func(*http.Request) (*http.Response, error)
+
+func (f endpointTestHTTPClient) Do(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestS3EndpointRequest(t *testing.T) {
+	previous := *config.AWS
+	t.Cleanup(func() { *config.AWS = previous })
+	config.AWS.S3Region = "us-east-1"
+	config.AWS.S3Bucket = "test-bucket"
+	config.AWS.AccessKeyID = "test"
+	config.AWS.SecretAccessKey = "test"
+	for _, test := range []struct {
+		name, endpoint, scheme, host string
+	}{
+		{"bare R2 hostname", "account.r2.cloudflarestorage.com", "https", "test-bucket.account.r2.cloudflarestorage.com"},
+		{"HTTPS endpoint", " https://account.r2.cloudflarestorage.com ", "https", "test-bucket.account.r2.cloudflarestorage.com"},
+		{"HTTP endpoint", "http://localhost:9000", "http", "test-bucket.localhost:9000"},
+		{"default AWS endpoint", "", "https", "test-bucket.s3.us-east-1.amazonaws.com"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config.AWS.S3Endpoint = test.endpoint
+			client, err := NewS3Client()
+			if err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			_, err = client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+				Bucket: &config.AWS.S3Bucket,
+			}, func(options *s3.Options) {
+				options.HTTPClient = endpointTestHTTPClient(func(request *http.Request) (*http.Response, error) {
+					called = true
+					if request.URL.Scheme != test.scheme || request.URL.Host != test.host {
+						t.Errorf("unexpected request URL: %s", request.URL)
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": {"application/xml"}},
+						Body:       io.NopCloser(strings.NewReader("<ListBucketResult/>")),
+					}, nil
+				})
+			})
+			if err != nil || !called {
+				t.Fatalf("bucket check failed: %v, called=%t", err, called)
+			}
+		})
+	}
+}
+
+func TestS3EndpointRejectsInvalidURLs(t *testing.T) {
+	previous := config.AWS.S3Endpoint
+	t.Cleanup(func() { config.AWS.S3Endpoint = previous })
+	for _, endpoint := range []string{"https://", "http:/broken", "ftp://example.com", "https://bad host", "https://user:password@example.com", "https://example.com?token=secret", "https://example.com#fragment"} {
+		config.AWS.S3Endpoint = endpoint
+		if _, err := NewS3Client(); err == nil || !strings.Contains(err.Error(), "AWS_S3_ENDPOINT") {
+			t.Errorf("did not reject malformed endpoint %q: %v", endpoint, err)
+		}
+	}
+}
 
 const multipartDumpSize = 2*manager.MinUploadPartSize + 137
 
