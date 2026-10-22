@@ -38,9 +38,7 @@ func normalizeS3Endpoint(endpoint string) (string, error) {
 	if endpoint == "" {
 		return "", nil
 	}
-	if strings.HasPrefix(endpoint, "//") {
-		endpoint = "https:" + endpoint
-	} else if !strings.Contains(endpoint, "://") {
+	if !strings.Contains(endpoint, "://") {
 		endpoint = "https://" + endpoint
 	}
 	u, err := url.Parse(endpoint)
