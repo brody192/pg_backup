@@ -6,18 +6,21 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/brody192/pg_backup/internal/config"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -82,7 +85,7 @@ func TestS3EndpointRejectsInvalidURLs(t *testing.T) {
 	}
 }
 
-const multipartDumpSize = 2*manager.MinUploadPartSize + 137
+const multipartDumpSize = 2*uploadPartSize + 137
 
 // Capture only in tests so the exact object sent through the SDK can be
 // decompressed and checked, including the final gzip checksum and size trailer.
@@ -179,7 +182,7 @@ func TestBackupUploadedGzipIntegrity(t *testing.T) {
 }
 
 type testS3Client struct {
-	manager.UploadAPIClient
+	transfermanager.S3APIClient
 	partError     error
 	completeError error
 	abortError    error
@@ -239,7 +242,7 @@ func TestUploadPartFailureUnblocksReaderAndAborts(t *testing.T) {
 			// block reading the next part when the first upload fails.
 			written := make(chan error, 1)
 			go func() {
-				_, err := io.CopyN(writer, zeroReader{}, manager.MinUploadPartSize)
+				_, err := io.CopyN(writer, zeroReader{}, uploadPartSize)
 				written <- err
 			}()
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -272,7 +275,7 @@ func TestUploadSourceFailureAbortsMultipart(t *testing.T) {
 	defer reader.Close()
 	defer writer.Close()
 	go func() {
-		_, err := io.CopyN(writer, zeroReader{}, manager.MinUploadPartSize+1)
+		_, err := io.CopyN(writer, zeroReader{}, uploadPartSize+1)
 		if err != nil {
 			writer.CloseWithError(err)
 			return
@@ -298,7 +301,7 @@ func TestUploadMultipartCompletion(t *testing.T) {
 			if completeFails {
 				client.completeError = errors.New("complete upload failed")
 			}
-			body := io.NopCloser(io.LimitReader(zeroReader{}, manager.MinUploadPartSize+1))
+			body := io.NopCloser(io.LimitReader(zeroReader{}, uploadPartSize+1))
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_, err := uploadToS3(ctx, client, "backup.gz", body)
@@ -310,4 +313,73 @@ func TestUploadMultipartCompletion(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Generate a large stream without storing it. Both the read-ahead limit and
+// heap limit are smaller than the object, so buffering it in full fails.
+type streamingUploadSource struct {
+	size        int64
+	read        int64
+	uploaded    atomic.Int64
+	bufferLimit int64
+	peakBuffer  int64
+	heapLimit   uint64
+	peakHeap    uint64
+}
+
+func (s *streamingUploadSource) Read(p []byte) (int, error) {
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	s.peakHeap = max(s.peakHeap, stats.HeapAlloc)
+	if stats.HeapAlloc > s.heapLimit {
+		return 0, fmt.Errorf("upload exceeded heap limit: %d > %d", stats.HeapAlloc, s.heapLimit)
+	}
+	if s.read == s.size {
+		return 0, io.EOF
+	}
+	n := min(int64(len(p)), s.size-s.read)
+	buffered := s.read + n - s.uploaded.Load()
+	s.peakBuffer = max(s.peakBuffer, buffered)
+	if buffered > s.bufferLimit {
+		return 0, fmt.Errorf("upload read too far ahead: %d > %d", buffered, s.bufferLimit)
+	}
+	clear(p[:n])
+	s.read += n
+	return int(n), nil
+}
+
+type streamingS3Client struct {
+	testS3Client
+	source *streamingUploadSource
+}
+
+func (c *streamingS3Client) UploadPart(_ context.Context, input *s3.UploadPartInput, _ ...func(*s3.Options)) (*s3.UploadPartOutput, error) {
+	n, err := io.Copy(io.Discard, input.Body)
+	c.source.uploaded.Add(n)
+	return &s3.UploadPartOutput{ETag: aws.String("test-etag")}, err
+}
+
+func TestUploadStreamsWithBoundedMemory(t *testing.T) {
+	configureBackupTest(t)
+	config.Backup.UploadConcurrency = 2
+	runtime.GC()
+	var baseline runtime.MemStats
+	runtime.ReadMemStats(&baseline)
+	source := &streamingUploadSource{
+		size:        4 * 1024 * 1024 * 1024,
+		bufferLimit: int64(config.Backup.UploadConcurrency+3) * uploadPartSize,
+		heapLimit:   baseline.HeapAlloc + 128*1024*1024,
+	}
+	client := &streamingS3Client{source: source}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := uploadToS3(ctx, client, "backup.gz", io.NopCloser(source)); err != nil {
+		t.Fatal(err)
+	}
+	if source.read != source.size || source.uploaded.Load() != source.size || !client.completed || client.aborted {
+		t.Fatalf("incomplete streamed upload: read=%d, uploaded=%d, completed=%t, aborted=%t",
+			source.read, source.uploaded.Load(), client.completed, client.aborted)
+	}
+	t.Logf("streamed %d MiB; peak heap growth %.1f MiB; peak read-ahead %.1f MiB",
+		source.size/(1024*1024), float64(source.peakHeap-baseline.HeapAlloc)/(1024*1024), float64(source.peakBuffer)/(1024*1024))
 }

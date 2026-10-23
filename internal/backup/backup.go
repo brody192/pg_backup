@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/brody192/pg_backup/internal/config"
+	"github.com/brody192/pg_backup/internal/logger"
 
-	"github.com/brody192/logger"
 	"github.com/klauspost/pgzip"
 	"github.com/miolini/datacounter"
 )
@@ -38,7 +38,7 @@ func RunBackup(ctx context.Context) error {
 		slog.String("filename", dump.filename),
 		logger.SizeAttrIEC(dump.compressedSize, "compressed_filesize"),
 		logger.SizeAttrIEC(dump.uncompressedSize, "un_compressed_filesize"),
-		logger.DurationAttr(dump.funcTime),
+		slog.String("duration", dump.funcTime.Round(time.Millisecond).String()),
 	)
 
 	if dump.stderr != "" {
@@ -51,7 +51,7 @@ func RunBackup(ctx context.Context) error {
 
 	logger.Stdout.Info("Backup Uploaded",
 		slog.String("filename_in_bucket", dump.filename),
-		logger.DurationAttr(upload.funcTime),
+		slog.String("duration", upload.funcTime.Round(time.Millisecond).String()),
 		logger.SizeAttrIEC(dump.compressedSize, "uploaded_size"),
 	)
 
@@ -59,7 +59,7 @@ func RunBackup(ctx context.Context) error {
 	runtime.ReadMemStats(&memStats)
 
 	logger.Stdout.Info("Database backup complete",
-		logger.DurationAttr(time.Since(sTime)),
+		slog.String("duration", time.Since(sTime).Round(time.Millisecond).String()),
 		slog.Group("mem_stats",
 			logger.SizeAttrIEC(memStats.TotalAlloc, "total_alloc"),
 			logger.SizeAttrIEC(memStats.Sys, "sys"),

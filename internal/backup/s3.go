@@ -13,7 +13,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -70,6 +70,8 @@ type uploadInfo struct {
 	funcTime time.Duration
 }
 
+const uploadPartSize = 5 * 1024 * 1024
+
 func UploadToS3(ctx context.Context, dumpFilename string, body io.ReadCloser) (*uploadInfo, error) {
 	client, err := NewS3Client()
 	if err != nil {
@@ -78,7 +80,7 @@ func UploadToS3(ctx context.Context, dumpFilename string, body io.ReadCloser) (*
 	return uploadToS3(ctx, client, dumpFilename, body)
 }
 
-func uploadToS3(ctx context.Context, client manager.UploadAPIClient, dumpFilename string, body io.ReadCloser) (*uploadInfo, error) {
+func uploadToS3(ctx context.Context, client transfermanager.S3APIClient, dumpFilename string, body io.ReadCloser) (*uploadInfo, error) {
 	if config.Backup.UploadConcurrency <= 0 {
 		return nil, errors.New("UPLOAD_CONCURRENCY must be greater than zero")
 	}
@@ -89,16 +91,17 @@ func uploadToS3(ctx context.Context, client manager.UploadAPIClient, dumpFilenam
 	stopWatching := context.AfterFunc(ctx, func() { body.Close() })
 	defer stopWatching()
 
-	uploader := manager.NewUploader(cancelOnPartErrorClient{client, cancel}, func(u *manager.Uploader) {
-		u.PartSize = 5 * 1024 * 1024
+	uploadClient := &cancelOnPartErrorClient{S3APIClient: client, cancel: cancel}
+	uploader := transfermanager.New(uploadClient, func(u *transfermanager.Options) {
+		u.PartSizeBytes = uploadPartSize
+		u.MultipartUploadThreshold = uploadPartSize
 		u.Concurrency = config.Backup.UploadConcurrency
-		// The SDK uses the upload context for aborts and discards abort errors.
-		// Handle cleanup below with a fresh deadline, even after cancellation.
-		u.LeavePartsOnError = true
+		// Abort failed uploads with a fresh deadline even after cancellation.
+		u.FailTimeout = 30 * time.Second
 	})
 
 	startTime := time.Now()
-	if _, err := uploader.Upload(ctx, &s3.PutObjectInput{
+	if _, err := uploader.UploadObject(ctx, &transfermanager.UploadObjectInput{
 		ContentType: aws.String("application/gzip"),
 		Bucket:      &config.AWS.S3Bucket,
 		Key:         &dumpFilename,
@@ -109,17 +112,8 @@ func uploadToS3(ctx context.Context, client manager.UploadAPIClient, dumpFilenam
 		if cause := context.Cause(ctx); cause != nil && !errors.Is(err, cause) {
 			err = errors.Join(err, cause)
 		}
-		var multipartErr manager.MultiUploadFailure
-		if errors.As(err, &multipartErr) && multipartErr.UploadID() != "" {
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-			defer cleanupCancel()
-			if _, abortErr := client.AbortMultipartUpload(cleanupCtx, &s3.AbortMultipartUploadInput{
-				Bucket:   &config.AWS.S3Bucket,
-				Key:      &dumpFilename,
-				UploadId: aws.String(multipartErr.UploadID()),
-			}); abortErr != nil {
-				err = errors.Join(err, fmt.Errorf("abort multipart upload %q: %w", multipartErr.UploadID(), abortErr))
-			}
+		if uploadClient.abortErr != nil {
+			err = errors.Join(err, uploadClient.abortErr)
 		}
 		return nil, fmt.Errorf("upload backup to S3: %w", err)
 	}
@@ -127,14 +121,24 @@ func uploadToS3(ctx context.Context, client manager.UploadAPIClient, dumpFilenam
 }
 
 type cancelOnPartErrorClient struct {
-	manager.UploadAPIClient
-	cancel context.CancelCauseFunc
+	transfermanager.S3APIClient
+	cancel   context.CancelCauseFunc
+	abortErr error
 }
 
-func (c cancelOnPartErrorClient) UploadPart(ctx context.Context, input *s3.UploadPartInput, opts ...func(*s3.Options)) (*s3.UploadPartOutput, error) {
-	output, err := c.UploadAPIClient.UploadPart(ctx, input, opts...)
+func (c *cancelOnPartErrorClient) UploadPart(ctx context.Context, input *s3.UploadPartInput, opts ...func(*s3.Options)) (*s3.UploadPartOutput, error) {
+	output, err := c.S3APIClient.UploadPart(ctx, input, opts...)
 	if err != nil {
 		c.cancel(err)
+	}
+	return output, err
+}
+
+func (c *cancelOnPartErrorClient) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput, opts ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error) {
+	output, err := c.S3APIClient.AbortMultipartUpload(ctx, input, opts...)
+	if err != nil {
+		// Preserve the cleanup error for errors.Is; the SDK formats it as text.
+		c.abortErr = fmt.Errorf("abort multipart upload %q: %w", aws.ToString(input.UploadId), err)
 	}
 	return output, err
 }

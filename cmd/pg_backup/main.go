@@ -8,8 +8,7 @@ import (
 
 	"github.com/brody192/pg_backup/internal/backup"
 	"github.com/brody192/pg_backup/internal/config"
-
-	"github.com/brody192/logger"
+	"github.com/brody192/pg_backup/internal/logger"
 )
 
 func main() {

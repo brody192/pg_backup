@@ -3,8 +3,8 @@ package config
 import (
 	"os"
 
-	"github.com/brody192/logger"
-	"github.com/caarlos0/env/v10"
+	"github.com/brody192/pg_backup/internal/logger"
+	"github.com/caarlos0/env/v11"
 )
 
 type aws struct {
