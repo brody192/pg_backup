@@ -1,4 +1,4 @@
-FROM golang:1.22.0-alpine as builder
+FROM golang:1.27.3-alpine3.24 AS builder
 
 WORKDIR /app
 
@@ -8,11 +8,11 @@ RUN go mod download
 
 COPY . ./
 
-RUN go build -ldflags="-w -s" -o main
+RUN go build -ldflags="-w -s" -o main ./cmd/pg_backup
 
-FROM alpine:3.18
+FROM alpine:3.24.3
 
-ARG PG_VERSION='16'
+ARG PG_VERSION='18'
 
 RUN apk add --update --no-cache postgresql${PG_VERSION}-client gzip --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main
 

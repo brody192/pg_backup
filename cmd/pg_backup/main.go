@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/brody192/pg_backup/internal/backup"
 	"github.com/brody192/pg_backup/internal/config"
 
 	"github.com/brody192/logger"
@@ -21,7 +22,7 @@ func main() {
 
 	logger.Stdout.Info("Checking access to bucket...")
 
-	if err := CheckBucketAccess(ctx); err != nil {
+	if err := backup.CheckBucketAccess(ctx); err != nil {
 		logger.Stderr.Error("Error checking bucket access", logger.ErrAttr(err))
 		os.Exit(1)
 	}
@@ -30,7 +31,7 @@ func main() {
 
 	logger.Stdout.Info("Starting backup...")
 
-	if err := RunBackup(ctx); err != nil {
+	if err := backup.RunBackup(ctx); err != nil {
 		logger.Stderr.Error("Error while running backup.. Exiting..", logger.ErrAttr(err))
 		os.Exit(1)
 	}
